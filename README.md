@@ -1,4 +1,3 @@
-# homelab-cisco-network-lab-rebuild-
 # Cisco Enterprise Network Lab — Rebuild (v2)
 
 ## Overview
@@ -248,6 +247,36 @@ Plus VLAN 100 (TRANSIT) on Core-Switch only, since it only connects the core to 
 
 **VTP transparent mode** means each switch keeps its own VLAN database and never syncs with the others, so one switch can't overwrite another's VLANs.
 
+### Unused port parking (all three switches)
+
+Every port not in use was moved into VLAN 999 (PARKING) and shut down, so nothing plugged into a spare port can land on a live VLAN.
+
+**Core-Switch** (in use: Gi0/1–0/6):
+
+```
+configure terminal
+interface range gi0/7 - 28
+ switchport mode access
+ switchport access vlan 999
+ shutdown
+end
+write memory
+```
+
+**Access-SW1 and Access-SW2** (in use: Gi0/1–0/2 and Fa0/24):
+
+```
+configure terminal
+interface range fa0/1 - 23
+ switchport mode access
+ switchport access vlan 999
+ shutdown
+end
+write memory
+```
+
+This goes further than v1, where unused ports were shut down but left in VLAN 1. A shut-down port in VLAN 1 is one `no shutdown` away from joining the default VLAN. A port in VLAN 999 lands in an isolated VLAN with no gateway, even if it's accidentally re-enabled. Ports get opened individually as devices are connected.
+
 ### Lessons Learned / Troubleshooting — Phase 1
 
 **Old IOS rejects inline RSA modulus.** On Core-Switch (12.2(25)SED1, from 2005), `crypto key generate rsa modulus 2048` failed with `% Invalid input detected`. That image doesn't accept the modulus as part of the command. Running `crypto key generate rsa` without it brings up a prompt for the key size, and I entered **1024**. This is the same aging image that needed `diffie-hellman-group1-sha1` for SSH in v1, and it's a good example of why IOS version matters when planning a feature.
@@ -258,10 +287,140 @@ My PC's only wired connection goes to the Deco, and I use it for gaming, so I di
 
 ---
 
+## Phase 2 — EtherChannel, Trunking, and Management
+
+### EtherChannel Po1 — Core-Switch ↔ Access-SW1 (LACP)
+
+**Core-Switch:**
+
+```
+configure terminal
+interface range gi0/5 - 6
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport nonegotiate
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,30,50,60,99
+ channel-group 1 mode active
+interface port-channel 1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport nonegotiate
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,30,50,60,99
+end
+write memory
+```
+
+**Access-SW1:** the same configuration on Gi0/1–0/2, without `switchport trunk encapsulation dot1q`. The 2960 only supports 802.1Q, so the command doesn't exist on it.
+
+### EtherChannel Po2 — Core-Switch ↔ Access-SW2 (PAgP)
+
+**Core-Switch:**
+
+```
+configure terminal
+interface range gi0/1 , gi0/3
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport nonegotiate
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,30,50,60,99
+ channel-group 2 mode desirable
+interface port-channel 2
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport nonegotiate
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,30,50,60,99
+end
+write memory
+```
+
+**Access-SW2:** the same configuration on Gi0/1–0/2, without the encapsulation command.
+
+Using **LACP on one bundle and PAgP on the other** was deliberate, so both negotiation protocols have been configured and verified on real hardware. LACP (IEEE 802.3ad) uses `active`/`passive`, while PAgP (Cisco proprietary) uses `desirable`/`auto`. The Core-Switch's member ports aren't consecutive, so the range uses comma syntax (`gi0/1 , gi0/3`).
+
+### Cross-link trunk — Access-SW1 ↔ Access-SW2
+
+Configured on Fa0/24 on both access switches:
+
+```
+configure terminal
+interface fa0/24
+ switchport mode trunk
+ switchport nonegotiate
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,30,50,60,99
+end
+write memory
+```
+
+A single link, so no channel-group. It exists only as a redundant path for STP.
+
+### Trunk design
+
+- **Native VLAN 99** on every trunk. It carries no traffic and has no SVI, so untagged frames on a trunk land somewhere harmless.
+- **VLAN 1 pruned from every trunk.** In v1, VLAN 1 had to stay on the trunks because management lived on it. With management on VLAN 30, VLAN 1 is gone entirely.
+- **`switchport nonegotiate`** disables DTP, so trunk mode is always set by configuration, never negotiated.
+
+### Management SVIs
+
+| Device | Interface | Address | Gateway |
+|---|---|---|---|
+| Core-Switch | Vlan30 | 10.10.30.1/24 | — |
+| Access-SW1 | Vlan30 | 10.10.30.11/24 | `ip default-gateway 10.10.30.1` |
+| Access-SW2 | Vlan30 | 10.10.30.12/24 | `ip default-gateway 10.10.30.1` |
+
+The access switches use `ip default-gateway` instead of a static route because they're Layer 2 switches. The gateway is only for their own management traffic.
+
+### Verification
+
+`show etherchannel summary`:
+
+```
+Core-Switch:
+1      Po1(SU)         LACP      Gi0/5(P)    Gi0/6(P)
+
+Access-SW2:
+2      Po2(SU)         PAgP      Gi0/1(P)    Gi0/2(P)
+```
+
+`show interfaces trunk` on Core-Switch:
+
+```
+Port        Mode         Encapsulation  Status        Native vlan
+Po1         on           802.1q         trunking      99
+Po2         on           802.1q         trunking      99
+
+Port        Vlans allowed on trunk
+Po1         10,20,30,50,60,99
+Po2         10,20,30,50,60,99
+```
+
+All VLANs are forwarding on both port-channels from the core, which suggests the blocked STP port is on the SW1↔SW2 cross-link. This gets confirmed and controlled deliberately in Phase 3.
+
+**End-to-end management test:** From Core-Switch, pinged 10.10.30.11 and 10.10.30.12 successfully, proving VLAN 30 crosses both bundles. Then SSHed from Core-Switch to both access switches (`ssh -l admin <ip>`) and confirmed the hostnames. My PC can't reach the lab yet, so using the core as the SSH client confirmed the access switches' SSH servers, local authentication, and VTY configuration work, without waiting on the routing phases.
+
+### Lessons Learned / Troubleshooting — Phase 2
+
+**Trunk settings before `channel-group`.** In v1, one EtherChannel member got suspended because its operational trunk mode was still dynamic even though the running config showed `switchport mode trunk`. This time the trunk settings were applied to the member ports in the same block, before the `channel-group` line. Both bundles came up with all members **(P)** on the first attempt, with no suspended ports and no interface bounce needed.
+
+**Applied the wrong switch's configuration.** I accidentally applied Access-SW1's Po1/LACP configuration to Access-SW2's uplink ports. No outage resulted, because the Core-Switch end of that link wasn't bundled yet, so SW2's ports had nothing to negotiate with. The clean way to undo it:
+
+```
+configure terminal
+no interface port-channel 1
+default interface range gi0/1 - 2
+end
+```
+
+`no interface port-channel 1` deletes the logical bundle and removes the `channel-group` lines from its members. `default interface range` then returns the physical ports to factory settings, clearing the leftover trunk configuration. `show etherchannel summary` confirmed zero channel-groups before I applied the correct Po2/PAgP configuration.
+
+---
+
 ## Next Steps
 
-- **Finish Phase 1:** Move all unused switch ports into VLAN 999 and shut them down.
-- **Phase 2:** EtherChannel (Po1 LACP to Access-SW1, Po2 PAgP to Access-SW2), 802.1Q trunks with native VLAN 99 and VLAN 1 pruned, and management SVIs in VLAN 30.
 - **Phase 3:** Rapid PVST+, Core-Switch set manually as root bridge, per-VLAN load balancing, PortFast, and BPDU Guard.
 - **Phase 4:** Inter-VLAN routing with SVIs on Core-Switch, and router-on-a-stick on Router1 for VLAN 50.
 - **Phase 5:** Static routing before OSPF, and routing table analysis.
