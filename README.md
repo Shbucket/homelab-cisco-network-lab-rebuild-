@@ -419,9 +419,194 @@ end
 
 ---
 
+## Phase 3 — Spanning Tree (Rapid PVST+)
+
+Every STP change in this phase followed the same method: **gather the facts, predict the result, then verify with `show` output.** The CCNA blueprint (topic 2.5) says to *interpret* Rapid PVST+ operation, so reading output and predicting behavior mattered as much as the configuration.
+
+### Baseline: predicting the default election
+
+Before changing anything, I collected each switch's base MAC address (`show version | include MAC`) to predict the election.
+
+| Switch | Base MAC | VLAN 10 priority |
+|---|---|---|
+| Core-Switch | 00:18:18:1B:F2:80 | 32778 (default) |
+| Access-SW2 | DC:A5:F4:83:1D:80 | 32778 (default) |
+| Access-SW1 | DC:A5:F4:E6:57:00 | 32778 (default) |
+
+**Prediction:**
+
+- **Root bridge:** All priorities tie at 32768 + VLAN ID, so the lowest MAC wins. The Core-Switch's `00` beats `DC` immediately.
+- **Root ports:** Each access switch reaches the root through its EtherChannel (cost 3). That beats the cross-link path (19 + 3 = 22).
+- **Blocked port:** On the Fa0/24 cross-link, both ends are cost 3 from the root, so the tie goes to the lower bridge ID. SW1 and SW2 match through `DC:A5:F4`, then `83` (SW2) beats `E6` (SW1), so **SW2 gets the designated port and SW1's Fa0/24 blocks.**
+
+**Verification** on Access-SW1, which matched the prediction exactly:
+
+```
+VLAN0010
+  Spanning tree enabled protocol ieee
+  Root ID    Priority    32778
+             Address     0018.181b.f280
+             Cost        3
+             Port        64 (Port-channel1)
+  Bridge ID  Priority    32778  (priority 32768 sys-id-ext 10)
+             Address     dca5.f4e6.5700
+
+Interface           Role Sts Cost      Prio.Nbr Type
+Fa0/24              Altn BLK 19        128.24   P2p
+Po1                 Root FWD 3         128.64   P2p
+```
+
+### Legacy PVST+ vs. Rapid PVST+ failover
+
+**Legacy PVST+ (802.1D):** Shut down Po1 on Access-SW1 and repeatedly checked Fa0/24. It moved through **BLK → LIS → LRN → FWD** and took about **30 seconds**: Forward Delay (15 seconds) for listening plus 15 seconds for learning. SW1 detected the failure directly because Po1 was its own link. An indirect failure would also wait out Max Age (20 seconds), for up to 50 seconds total.
+
+**Rapid PVST+ (802.1w):**
+
+```
+configure terminal
+spanning-tree mode rapid-pvst
+end
+write memory
+```
+
+Applied on all three switches. `show spanning-tree` then reported `protocol rstp`. Repeated the same test: Fa0/24 went from **Altn BLK** to **Root FWD immediately**, with no listening or learning. In RSTP, an alternate port is a pre-calculated backup root port, so when the root port fails, it's promoted right away. It became a **Root** port rather than Designated because it was now SW1's only path to the root.
+
+| | Legacy PVST+ | Rapid PVST+ |
+|---|---|---|
+| Failover time (direct failure) | ~30 seconds | Immediate |
+| States seen | BLK → LIS → LRN → FWD | BLK → FWD |
+
+### Deterministic root and per-VLAN load balancing
+
+The Core-Switch was root only because it happened to have the lowest MAC. I made that deliberate:
+
+```
+! Core-Switch
+spanning-tree vlan 10,20,30,50,60,99 root primary
+
+! Access-SW1
+spanning-tree vlan 10,30 root secondary
+
+! Access-SW2
+spanning-tree vlan 20,50 root secondary
+```
+
+- **`root primary`** set the Core-Switch's priority to 24576. For VLAN 10 that's **24586** with the sys-id-ext, which I predicted correctly before checking. It uses 24576 only if that beats the current root; otherwise it goes 4096 below the existing root. Priorities must be multiples of 4096.
+- **`root secondary`** sets 28672, a backup root if the core fails. IOS saves both commands as `spanning-tree vlan X priority Y`, not as written.
+
+Because the Core-Switch is root for every VLAN, the secondary priorities also decide the **cross-link tiebreaker per VLAN**:
+
+| VLAN | SW1 priority | SW2 priority | Fa0/24 blocks on |
+|---|---|---|---|
+| 10, 30 | 28682 / 28702 | 32778 / 32798 | **SW2** |
+| 20, 50 | 32788 / 32818 | 28692 / 28722 | **SW1** |
+| 60, 99 | default | default | **SW1** (tie, SW2 has the lower MAC) |
+
+**Verification:** VLAN 10 showed Fa0/24 **Altn BLK** on SW2, and VLAN 20 showed Fa0/24 **Altn BLK** on SW1. It's the same physical cable, but a different end blocks depending on the VLAN. That's what the "per VLAN" in PVST+ means in practice. `show spanning-tree summary` confirmed the pattern in the Blocking column on both switches.
+
+### PortFast and BPDU Guard
+
+On both access switches:
+
+```
+configure terminal
+spanning-tree portfast default
+spanning-tree portfast bpduguard default
+end
+write memory
+```
+
+The global forms apply to every access port automatically, including ports opened later, so a new port can't be forgotten. Trunks aren't affected. (The per-interface equivalents are `spanning-tree portfast` and `spanning-tree bpduguard enable`.)
+
+**Live test:** Opened Fa0/1 and Fa0/2 on Access-SW1 and connected them to each other with a patch cable, simulating an unauthorized switch on an access port:
+
+```
+%SPANTREE-2-BLOCK_BPDUGUARD: Received BPDU on port FastEthernet0/2 with BPDU Guard enabled. Disabling port.
+%PM-4-ERR_DISABLE: bpduguard error detected on Fa0/2, putting Fa0/2 in err-disable state
+%SPANTREE-2-BLOCK_BPDUGUARD: Received BPDU on port FastEthernet0/1 with BPDU Guard enabled. Disabling port.
+%PM-4-ERR_DISABLE: bpduguard error detected on Fa0/1, putting Fa0/1 in err-disable state
+```
+
+```
+Access-SW1#show interfaces status err-disabled
+Port      Name               Status       Reason
+Fa0/1                        err-disabled bpduguard
+Fa0/2                        err-disabled bpduguard
+```
+
+Both ports shut down within milliseconds of each other.
+
+**Recovery:** An err-disabled port stays down even after the cause is removed. I recovered manually (removed the cable, then `shutdown` / `no shutdown`), then configured automatic recovery:
+
+```
+errdisable recovery cause bpduguard
+errdisable recovery interval 60
+```
+
+With this, a port retries after 60 seconds and gets err-disabled again if the rogue device is still connected. Both test ports were parked again afterward.
+
+### Root guard
+
+Applied to the Core-Switch's downlinks, so neither access switch can ever become root:
+
+```
+interface port-channel 1
+ spanning-tree guard root
+interface port-channel 2
+ spanning-tree guard root
+```
+
+**Live test:** Set Access-SW1's VLAN 10 priority to 0, beating the Core-Switch's 24576. I predicted which core port-channels would react before checking:
+
+```
+Core-Switch#show spanning-tree inconsistentports
+Name                 Interface              Inconsistency
+VLAN0010             Port-channel1          Root Inconsistent
+VLAN0010             Port-channel2          Root Inconsistent
+```
+
+**Both** port-channels went root-inconsistent, not just Po1. SW2 received SW1's superior BPDU over the Fa0/24 cross-link, accepted SW1 as root for VLAN 10, and relayed that claim up Po2. Root guard chose to isolate VLAN 10 from the access layer rather than let the root move. Other VLANs, including management on VLAN 30, were unaffected.
+
+Restoring SW1's VLAN 10 priority to 28672 cleared both ports **automatically**, with no action needed on the Core-Switch. Setting `priority 0` had replaced the earlier secondary priority, so it had to be set again rather than simply removed.
+
+| | BPDU Guard | Root guard |
+|---|---|---|
+| Trigger | Any BPDU on a PortFast port | A superior BPDU (better root) |
+| Result | Err-disabled | Root-inconsistent (blocking) |
+| Recovery | Manual, or errdisable recovery timer | Automatic once superior BPDUs stop |
+| Placement | Access ports | Downlinks toward access switches |
+
+### Loop guard
+
+Enabled globally on both access switches:
+
+```
+spanning-tree loopguard default
+```
+
+Loop guard protects non-designated ports (root and alternate), which in this topology are the access switches' uplinks and the cross-link. Those ports stay in their role *because* they keep receiving BPDUs. If BPDUs stop because of a one-way link failure, normal STP would move the port to forwarding and create a loop. Loop guard puts it into **loop-inconsistent** (blocking) instead, and recovers automatically when BPDUs return. A one-way failure is hard to simulate on copper, so this was configured and verified in `show spanning-tree summary` but not failure-tested.
+
+**BPDU filter** was deliberately **not** configured. It stops a port from sending or processing BPDUs, effectively disabling STP on that port. A filtered port that gets looped won't detect the loop, and when BPDU filter and BPDU Guard are on the same port, the filter wins and BPDU Guard never triggers. BPDU filter *suppresses* BPDUs, while BPDU Guard *reacts* to them.
+
+### Lessons Learned / Troubleshooting — Phase 3
+
+**A wrong prediction caught a misconfiguration.** After configuring the secondary roots, I predicted SW2's Fa0/24 would block in VLAN 10, but the output showed **Desg FWD**. Rather than doubting the prediction, I checked its inputs. `show spanning-tree vlan 10 | include Priority` showed SW2 at 28682, the priority meant for SW1. Then `show run | include spanning-tree vlan` showed exactly what happened:
+
+```
+Access-SW2#show run | include spanning-tree vlan
+spanning-tree vlan 10,20,30,50 priority 28672
+```
+
+Both switches' `root secondary` commands had been entered on SW2. The fix was `no spanning-tree vlan 10,30 priority` on SW2 and `spanning-tree vlan 10,30 root secondary` on SW1, after which both predictions verified. The prediction was right all along. The mismatch between expected and actual output is what exposed the configuration error.
+
+**`include` filters are case-sensitive.** `show spanning-tree vlan 10 | include f0/24` returned nothing, because the output shows `Fa0/24`. The filter matches the exact text in the output, not the interface name as you'd type it in a command.
+
+**Unset clock.** The BPDU Guard log messages were timestamped `*Mar 1`. The asterisk means the clock was never set and isn't trusted. Log timestamps are meaningless until NTP is configured in Phase 8.
+
+---
+
 ## Next Steps
 
-- **Phase 3:** Rapid PVST+, Core-Switch set manually as root bridge, per-VLAN load balancing, PortFast, and BPDU Guard.
 - **Phase 4:** Inter-VLAN routing with SVIs on Core-Switch, and router-on-a-stick on Router1 for VLAN 50.
 - **Phase 5:** Static routing before OSPF, and routing table analysis.
 - **Phase 6:** Single-area OSPF with a deliberately chosen DR and a default route originated from Router1.
