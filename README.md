@@ -605,12 +605,226 @@ Both switches' `root secondary` commands had been entered on SW2. The fix was `n
 
 ---
 
+## Phase 4 — Inter-VLAN Routing and Remote Management
+
+### SVIs on Core-Switch
+
+```
+configure terminal
+ip routing
+interface vlan 10
+ ip address 10.10.10.1 255.255.255.0
+ no shutdown
+interface vlan 20
+ ip address 10.10.20.1 255.255.255.0
+ no shutdown
+interface vlan 100
+ ip address 10.0.100.1 255.255.255.0
+ no shutdown
+interface loopback 0
+ ip address 10.255.0.1 255.255.255.255
+end
+write memory
+```
+
+The VLAN 30 SVI already existed from Phase 2. `ip routing` turns the 3560G into a router as well as a switch. Without it, SVIs only work as management addresses and nothing routes between them. Loopback 0 never goes down and will serve as the OSPF router ID in Phase 6.
+
+**Predicting SVI state:** Before checking, I predicted that VLANs 10, 20, and 30 would come up and VLAN 100 would stay down. An SVI only comes up when its VLAN has at least one active, forwarding port on the switch. VLANs 10, 20, and 30 ride the trunks to the access switches, but no port was in VLAN 100 yet. `show ip interface brief` confirmed it: VLAN 100 was the only SVI that wasn't up.
+
+### Trunks to the routers
+
+Core-Switch Gi0/2 (Router1) and Gi0/4 (Router2) became trunks, so each router can use subinterfaces for several VLANs on one physical port:
+
+```
+configure terminal
+interface range gi0/2 , gi0/4
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport nonegotiate
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 50,60,99,100
+ no shutdown
+end
+write memory
+```
+
+As predicted, the VLAN 100 SVI came up immediately, **before the routers had any subinterfaces configured**. The SVI only needs a forwarding port on the switch, and it doesn't verify the far end. That's a good reminder that an up SVI proves nothing about end-to-end connectivity, which is why every step here was confirmed with a ping.
+
+### Router subinterfaces (router-on-a-stick)
+
+**Router1:**
+
+```
+configure terminal
+interface g0/1.50
+ encapsulation dot1Q 50
+ ip address 10.10.50.1 255.255.255.0
+interface g0/1.100
+ encapsulation dot1Q 100
+ ip address 10.0.100.2 255.255.255.0
+interface g0/1.99
+ encapsulation dot1Q 99 native
+end
+write memory
+```
+
+**Router2:** G0/1.100 at 10.0.100.3 and G0/1.99 as native. Router2 joins VLAN 50 in Phase 8 for HSRP.
+
+- `encapsulation dot1Q` must come before the IP address on a subinterface, or IOS rejects the address.
+- G0/1.99 with `native` matches the switch's native VLAN, so untagged frames are handled consistently. It has no IP because VLAN 99 carries no traffic.
+- Subinterface numbers don't have to match VLAN IDs. Matching them is just convention for readability.
+
+### Remote management from my PC
+
+In v1, the home network was bridged into VLAN 1, so my PC was on the same subnet as every device. In v2, the home network connects only to Router1 G0/0, so SSH from my PC is a routing problem. It needed routes in both directions:
+
+**Router1 joins the home network** (10.0.0.0/24, Deco at 10.0.0.1):
+
+```
+interface g0/0
+ description UPLINK-TO-HOME-DECO
+ ip address 10.0.0.15 255.255.255.0
+ no shutdown
+```
+
+**Lab routes back toward the home network** (temporary static routes, to be replaced by OSPF in Phase 6):
+
+```
+! Core-Switch: send anything unknown to Router1
+ip route 0.0.0.0 0.0.0.0 10.0.100.2
+
+! Router1: one summary route covers every lab VLAN (10, 20, 30, 50)
+ip route 10.10.0.0 255.255.0.0 10.0.100.1
+
+! Router2: send anything unknown to Router1
+ip route 0.0.0.0 0.0.0.0 10.0.100.2
+```
+
+The access switches already pointed at 10.10.30.1 with `ip default-gateway`, so their replies follow the Core-Switch's default route to Router1.
+
+**My PC's routes to the lab** (PowerShell as Administrator):
+
+```
+route -p add 10.10.0.0 mask 255.255.0.0 10.0.0.15
+route -p add 10.0.100.0 mask 255.255.255.0 10.0.0.15
+```
+
+Only lab traffic goes to Router1. Everything else, including gaming, still goes straight to the Deco, so the gaming connection never depends on the lab. `-p` makes the routes survive a reboot.
+
+**SSH config (`~/.ssh/config`)**, updated for the v2 addresses:
+
+| Host alias | Address | Key exchange override |
+|---|---|---|
+| core-switch | 10.10.30.1 | diffie-hellman-group1-sha1 |
+| access-sw1 | 10.10.30.11 | diffie-hellman-group14-sha1 |
+| access-sw2 | 10.10.30.12 | diffie-hellman-group14-sha1 |
+| router1 | 10.0.0.15 | diffie-hellman-group14-sha1 |
+| router2 | 10.0.100.3 | diffie-hellman-group14-sha1 |
+
+All hosts also add `HostKeyAlgorithms +ssh-rsa`, `Ciphers +aes128-cbc`, and `MACs +hmac-sha1`.
+
+**Result:** SSH from my PC to all five devices, including **Core-Switch**, which never fully worked over SSH in v1 and needed a Telnet fallback. Telnet is now disabled on every device.
+
+### Proxmox host on a trunk (single NIC)
+
+In v1, moving one VM to a different VLAN with an access port took the entire Proxmox host offline, because the host's own management shared that port. The v2 fix makes the host's switch port an **802.1Q trunk** and the Proxmox bridge **VLAN-aware**: the host's management lives in VLAN 30, and each VM is tagged into its own VLAN, all over one NIC.
+
+**Order mattered** to avoid locking myself out. The Proxmox network changes were staged in the web UI (while the host was temporarily on the home network) but **not applied**:
+
+```
+auto vmbr0
+iface vmbr0 inet manual
+	bridge-ports nic0
+	bridge-stp off
+	bridge-fd 0
+	bridge-vlan-aware yes
+	bridge-vids 2-4094
+
+auto vmbr0.30
+iface vmbr0.30 inet static
+	address 10.10.30.50/24
+	gateway 10.10.30.1
+```
+
+Then I shut down the host, configured the switch port, recabled, and booted. The pending changes applied at startup.
+
+**Access-SW2 Fa0/20:**
+
+```
+interface fa0/20
+ description PROXMOX-HOST
+ switchport mode trunk
+ switchport nonegotiate
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,30,50,60
+ spanning-tree portfast trunk
+ no shutdown
+```
+
+`spanning-tree portfast trunk` is needed because the global PortFast default only applies to access ports, and the Proxmox host is an end device, not a switch. `bridge-stp off` on the Proxmox side means it sends no BPDUs, so BPDU Guard doesn't trigger.
+
+**Result:** Proxmox web UI reachable from my PC at `https://10.10.30.50:8006`, routed through Router1 and Core-Switch and down the trunk. The host has no internet access until NAT is configured in Phase 8, because the Deco has no return route to 10.10.x.x.
+
+### End-to-end verification with a real VM
+
+**SVI routing (VLAN 10):** Tagged a Windows VM into VLAN 10 in Proxmox, with static IP 10.10.10.50/24 and gateway 10.10.10.1:
+
+| Ping from VM | Result | Proves |
+|---|---|---|
+| 10.10.10.1 | Success | VM reaches its own gateway |
+| 10.10.20.1 | Success | Core-Switch routes between VLANs |
+| 10.10.30.11 | Success | Routed all the way to Access-SW1's management |
+
+This is the end-to-end inter-VLAN test that had to be done in Packet Tracer in v1 because of the single-NIC problem.
+
+**Router-on-a-stick (VLAN 50):** Moved the same VM to VLAN 50 (10.10.50.50/24, gateway 10.10.50.1 on Router1). Before testing, I predicted the path of a ping to 10.10.10.1:
+
+1. VM → Access-SW2 → Core-Switch, tagged VLAN 50. The Core-Switch has no VLAN 50 SVI, so it only **switches** the frame up the trunk.
+2. Router1 receives it on G0/1.50 and **routes** it using the 10.10.0.0/16 static route.
+3. Router1 sends it back down **the same physical cable**, tagged VLAN 100.
+4. Core-Switch receives it on its VLAN 100 SVI and replies, since 10.10.10.1 is its own address.
+
+Both pings to 10.10.50.1 and 10.10.10.1 succeeded. This hairpin, the same cable carrying the traffic twice under different tags, is the main drawback of router-on-a-stick compared with SVIs on a Layer 3 switch.
+
+### Lessons Learned / Troubleshooting — Phase 4
+
+**Password recovery left an interface shut down.** Router2 couldn't reach anything after its subinterfaces were configured. `show ip interface brief` showed G0/1 and every subinterface **administratively down**. Earlier, I had done ROMMON password recovery on Router2, which reloads the config with `copy startup-config running-config`. That merges the saved config, but interfaces stay shut down, because `no shutdown` isn't stored in the config as a command. One `no shutdown` on the physical G0/1 brought it up, and the subinterfaces followed automatically.
+
+**A one-digit typo in an SVI address.** After Router2 was fixed, Router1 could ping Router2, but the Core-Switch couldn't. Router-to-router traffic crossing the Core-Switch proved Layer 2 in VLAN 100 was fine, so I checked the Core-Switch's ARP table:
+
+```
+Internet  10.10.100.1   -   0018.181b.f2c4  ARPA   Vlan100
+```
+
+The VLAN 100 SVI was **10.10.100.1**, not **10.0.100.1**. That put the Core-Switch in a different subnet from the routers, so it treated 10.0.100.x as a remote network with no route and never even sent an ARP request. The missing ARP entries for both routers were the clue.
+
+**Wrong subnet mask on a summary route.** Router1 couldn't reach Access-SW1 after the static routes were added. `show ip route static` showed:
+
+```
+S        10.10.0.0/24 [1/0] via 10.0.100.1
+```
+
+The mask had gone in as 255.255.255.0 instead of 255.255.0.0. A /24 only covers 10.10.0.0–10.10.0.255, so none of the lab VLANs matched it. Removing the route and re-adding it as /16 fixed it immediately. A summary route is only as good as its mask.
+
+**SSH host key warnings after the rebuild.** SSH from my PC failed with `REMOTE HOST IDENTIFICATION HAS CHANGED`. Expected, because `crypto key zeroize rsa` and the new key generation gave every device a new identity, while my PC still had the v1 keys saved. Since I knew why the keys changed, it was safe to remove the old entries with `ssh-keygen -R <address>` and accept the new keys. In production, this exact warning would be a reason to stop and investigate before connecting.
+
+**Windows blocks inbound ping.** Router1 could ping the Deco but not my PC. Windows Firewall drops inbound ICMP echo by default, so a failed ping *to* a Windows machine doesn't mean it's unreachable. Testing in the other direction (PC → Router1) confirmed connectivity.
+
+**Forgot to change the VM's VLAN tag.** Pings from the VM in VLAN 50 failed, even to its own gateway. Rather than guessing, I used the MAC address tables to find where the frames stopped:
+
+- Core-Switch `show mac address-table vlan 50`: **no learned MACs at all**, so no VLAN 50 frames from either direction.
+- After pinging the VM from Router1, Access-SW2 learned Router1's MAC (0007.7d78.7701) on Po2, proving the Router1 → Core-Switch → SW2 path in VLAN 50 worked.
+- No MAC on **Fa0/20** (the Proxmox port), so the VM wasn't sending anything in VLAN 50.
+
+That pointed straight at the VM side, where the Proxmox VLAN tag was still set to 10. I had changed the IP inside Windows but not the tag in Proxmox. Changing it to 50 fixed it. The MAC address table is the right tool for Layer 2 problems: it shows exactly which devices a switch has heard from, and on which port.
+
+---
+
 ## Next Steps
 
-- **Phase 4:** Inter-VLAN routing with SVIs on Core-Switch, and router-on-a-stick on Router1 for VLAN 50.
 - **Phase 5:** Static routing before OSPF, and routing table analysis.
 - **Phase 6:** Single-area OSPF with a deliberately chosen DR and a default route originated from Router1.
 - **Phase 7:** IPv6 addressing (EUI-64, link-local, SLAAC) and static routing on the routers.
 - **Phase 8:** DHCP with relay, NAT/PAT through the home network, NTP, Syslog, SNMP, and HSRP.
-- **Phase 9:** Redesigned ACLs, port security, DHCP snooping, and Dynamic ARP Inspection.
+- **Phase 9:** Redesigned ACLs, port security, DHCP snooping, and Dynamic ARP Inspection. The VTY access-class must permit my home network (10.0.0.0/24) as well as VLAN 30, since I now manage the lab from 10.0.0.88.
 - **Phase 10:** Netmiko automation, and a full power-cycle sign-off.
