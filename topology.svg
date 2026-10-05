@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 860" width="1000" height="860" font-family="Helvetica, Arial, sans-serif">
+  <rect width="1000" height="860" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="500" y="36" text-anchor="middle" font-size="22" font-weight="700" fill="#1f2328">Cisco Homelab v2 — Collapsed Core Topology</text>
+
+  <!-- OSPF area boundary -->
+  <rect x="120" y="170" width="760" height="292" rx="16" fill="none" stroke="#1a56db" stroke-width="1.5" stroke-dasharray="7 5" opacity="0.6"/>
+  <text x="866" y="452" text-anchor="end" font-size="13" font-weight="700" fill="#1a56db">OSPF Area 0</text>
+
+  <!-- Links: home to Router1 -->
+  <line x1="460" y1="116" x2="300" y2="190" stroke="#57606a" stroke-width="2.5"/>
+  <text x="372" y="146" text-anchor="end" font-size="12" fill="#57606a">G0/0 · 10.0.0.15</text>
+  <text x="372" y="161" text-anchor="end" font-size="11" fill="#8c959f">internet edge · default route</text>
+
+  <!-- Links: routers to core (trunks) -->
+  <line x1="260" y1="262" x2="410" y2="360" stroke="#57606a" stroke-width="2.5"/>
+  <line x1="740" y1="262" x2="590" y2="360" stroke="#57606a" stroke-width="2.5"/>
+  <text x="300" y="320" text-anchor="end" font-size="12" fill="#57606a">G0/1 ↔ Gi0/2</text>
+  <text x="700" y="320" font-size="12" fill="#57606a">Gi0/4 ↔ G0/1</text>
+  <text x="500" y="298" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">802.1Q trunks · VLAN 50, 60, 99, 100</text>
+  <text x="500" y="315" text-anchor="middle" font-size="11" fill="#57606a">VLAN 100 transit 10.0.100.0/24 (.1 core · .2 R1 · .3 R2)</text>
+
+  <!-- Links: Po1 (core to SW1) -->
+  <line x1="352" y1="444" x2="236" y2="580" stroke="#137333" stroke-width="2.5"/>
+  <line x1="366" y1="444" x2="250" y2="580" stroke="#137333" stroke-width="2.5"/>
+  <ellipse cx="301" cy="512" rx="20" ry="9" fill="none" stroke="#137333" stroke-width="1.5" transform="rotate(-49 301 512)"/>
+  <text x="276" y="500" text-anchor="end" font-size="12" font-weight="700" fill="#137333">Po1 · LACP</text>
+  <text x="276" y="515" text-anchor="end" font-size="11" fill="#57606a">2 × 1 Gbps · Gi0/5–6</text>
+
+  <!-- Links: Po2 (core to SW2) -->
+  <line x1="634" y1="444" x2="750" y2="580" stroke="#137333" stroke-width="2.5"/>
+  <line x1="648" y1="444" x2="764" y2="580" stroke="#137333" stroke-width="2.5"/>
+  <ellipse cx="699" cy="512" rx="20" ry="9" fill="none" stroke="#137333" stroke-width="1.5" transform="rotate(49 699 512)"/>
+  <text x="724" y="500" font-size="12" font-weight="700" fill="#137333">Po2 · PAgP</text>
+  <text x="724" y="515" font-size="11" fill="#57606a">2 × 1 Gbps · Gi0/1, Gi0/3</text>
+
+  <!-- Cross-link -->
+  <line x1="350" y1="632" x2="650" y2="632" stroke="#d93025" stroke-width="2.5" stroke-dasharray="9 6"/>
+  <text x="500" y="620" text-anchor="middle" font-size="12" font-weight="700" fill="#d93025">Fa0/24 cross-link · STP alternate</text>
+  <text x="500" y="652" text-anchor="middle" font-size="11" fill="#57606a">blocks on SW2 for VLAN 10/30, on SW1 for 20/50</text>
+
+  <!-- Proxmox link -->
+  <line x1="770" y1="658" x2="770" y2="722" stroke="#7e22ce" stroke-width="2.5"/>
+  <text x="782" y="694" font-size="11" fill="#57606a">Fa0/20 · trunk 10, 20, 30, 50, 60</text>
+
+  <!-- Home network -->
+  <rect x="390" y="60" width="220" height="56" rx="10" fill="#f6f8fa" stroke="#57606a" stroke-width="2"/>
+  <text x="500" y="84" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">Home Network / Internet</text>
+  <text x="500" y="103" text-anchor="middle" font-size="12" fill="#57606a">TP-Link Deco · 10.0.0.0/24</text>
+
+  <!-- Router1 -->
+  <rect x="150" y="190" width="220" height="72" rx="10" fill="#e8f0fe" stroke="#1a56db" stroke-width="2"/>
+  <text x="260" y="213" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">Router1</text>
+  <text x="260" y="231" text-anchor="middle" font-size="12" fill="#57606a">Cisco 1941 · Lo0 10.255.0.2</text>
+  <text x="260" y="249" text-anchor="middle" font-size="11" fill="#1a56db">OSPF BDR · VLAN 50 gateway</text>
+
+  <!-- Router2 -->
+  <rect x="630" y="190" width="220" height="72" rx="10" fill="#e8f0fe" stroke="#1a56db" stroke-width="2"/>
+  <text x="740" y="213" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">Router2</text>
+  <text x="740" y="231" text-anchor="middle" font-size="12" fill="#57606a">Cisco 1941 · Lo0 10.255.0.3</text>
+  <text x="740" y="249" text-anchor="middle" font-size="11" fill="#1a56db">OSPF DROTHER</text>
+
+  <!-- Core switch -->
+  <rect x="300" y="360" width="400" height="84" rx="10" fill="#e6f4ea" stroke="#137333" stroke-width="2.5"/>
+  <text x="500" y="386" text-anchor="middle" font-size="16" font-weight="700" fill="#1f2328">Core-Switch</text>
+  <text x="500" y="405" text-anchor="middle" font-size="12" fill="#57606a">Catalyst 3560G · Layer 3 collapsed core · Lo0 10.255.0.1</text>
+  <text x="500" y="424" text-anchor="middle" font-size="11" fill="#137333">SVIs 10/20/30/100 · STP root (all VLANs) · OSPF DR</text>
+
+  <!-- Access-SW1 -->
+  <rect x="110" y="580" width="240" height="78" rx="10" fill="#fef7e0" stroke="#b06000" stroke-width="2"/>
+  <text x="230" y="604" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">Access-SW1</text>
+  <text x="230" y="622" text-anchor="middle" font-size="12" fill="#57606a">Catalyst 2960 · 10.10.30.11</text>
+  <text x="230" y="641" text-anchor="middle" font-size="11" fill="#b06000">STP secondary root · VLAN 10, 30</text>
+
+  <!-- Access-SW2 -->
+  <rect x="650" y="580" width="240" height="78" rx="10" fill="#fef7e0" stroke="#b06000" stroke-width="2"/>
+  <text x="770" y="604" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">Access-SW2</text>
+  <text x="770" y="622" text-anchor="middle" font-size="12" fill="#57606a">Catalyst 2960 · 10.10.30.12</text>
+  <text x="770" y="641" text-anchor="middle" font-size="11" fill="#b06000">STP secondary root · VLAN 20, 50</text>
+
+  <!-- Proxmox -->
+  <rect x="650" y="722" width="240" height="72" rx="10" fill="#f3e8fd" stroke="#7e22ce" stroke-width="2"/>
+  <text x="770" y="745" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">Proxmox VE host</text>
+  <text x="770" y="763" text-anchor="middle" font-size="12" fill="#57606a">OptiPlex 7060 · mgmt 10.10.30.50</text>
+  <text x="770" y="781" text-anchor="middle" font-size="11" fill="#7e22ce">VLAN-aware bridge · tagged VMs</text>
+
+  <!-- VLAN legend -->
+  <rect x="110" y="700" width="480" height="134" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+  <text x="128" y="724" font-size="13" font-weight="700" fill="#1f2328">VLANs</text>
+  <g font-size="12" fill="#1f2328">
+    <text x="128" y="746"><tspan font-weight="700">10</tspan> WORKSTATIONS · 10.10.10.0/24</text>
+    <text x="128" y="766"><tspan font-weight="700">20</tspan> SERVERS · 10.10.20.0/24</text>
+    <text x="128" y="786"><tspan font-weight="700">30</tspan> MGMT · 10.10.30.0/24</text>
+    <text x="128" y="806"><tspan font-weight="700">50</tspan> GUEST · 10.10.50.0/24 (R1)</text>
+    <text x="360" y="746"><tspan font-weight="700">60</tspan> IPV6-LAB · 2001:db8:60::/64</text>
+    <text x="360" y="766"><tspan font-weight="700">99</tspan> NATIVE (no traffic)</text>
+    <text x="360" y="786"><tspan font-weight="700">100</tspan> TRANSIT · 10.0.100.0/24</text>
+    <text x="360" y="806"><tspan font-weight="700">999</tspan> PARKING (unused ports)</text>
+  </g>
+  <text x="128" y="826" font-size="11" fill="#57606a">VLAN 1 pruned from every trunk</text>
+</svg>
