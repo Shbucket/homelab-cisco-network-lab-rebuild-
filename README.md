@@ -820,9 +820,113 @@ That pointed straight at the VM side, where the Proxmox VLAN tag was still set t
 
 ---
 
+## Phase 5 — Static Routing
+
+Static routing comes before OSPF on purpose, so I understand exactly what a dynamic routing protocol replaces. Three static routes already existed from Phase 4 (added to get remote SSH working). This phase extended them and focused on reading the routing table and predicting reachability.
+
+### Loopbacks on the routers
+
+```
+! Router1
+interface loopback 0
+ ip address 10.255.0.2 255.255.255.255
+
+! Router2
+interface loopback 0
+ ip address 10.255.0.3 255.255.255.255
+```
+
+Core-Switch already had Loopback 0 (10.255.0.1). These will become the OSPF router IDs in Phase 6.
+
+### Predicting reachability: "there and back"
+
+Before testing, I predicted each ping using two questions:
+
+1. Does the **sender** have a route to the destination?
+2. Does the **destination** have a route back to the sender's **source address**, which is the IP of the interface the ping leaves from, not the loopback?
+
+Static routes in place at the time:
+
+| Device | Static route |
+|---|---|
+| Core-Switch | 0.0.0.0/0 → 10.0.100.2 (Router1) |
+| Router1 | 10.10.0.0/16 → 10.0.100.1 (Core-Switch) |
+| Router2 | 0.0.0.0/0 → 10.0.100.2 (Router1) |
+
+| Ping | Prediction | Reasoning | Actual |
+|---|---|---|---|
+| Core-Switch → 10.255.0.2 | Works | Default route there; reply to 10.0.100.1 is directly connected on Router1 | Works |
+| Router1 → 10.255.0.1 | Fails | 10.255.0.1 is outside 10.10.0.0/16, and Router1 had no default route | Fails |
+| Router1 → 10.255.0.3 | Fails | No matching route, no default | Fails |
+| Router2 → 10.255.0.2 | Works | Default route there; reply to 10.0.100.3 is directly connected | Works |
+
+All four matched.
+
+### Host routes
+
+Router1 got /32 host routes to the other two loopbacks:
+
+```
+ip route 10.255.0.1 255.255.255.255 10.0.100.1
+ip route 10.255.0.3 255.255.255.255 10.0.100.3
+```
+
+Both previously failed pings then succeeded.
+
+### Reading the routing table
+
+```
+Router1#show ip route static
+Gateway of last resort is not set
+
+      10.0.0.0/8 is variably subnetted, 10 subnets, 3 masks
+S        10.10.0.0/16 [1/0] via 10.0.100.1
+S        10.255.0.1/32 [1/0] via 10.0.100.1
+S        10.255.0.3/32 [1/0] via 10.0.100.3
+```
+
+- **`[1/0]`** is [administrative distance / metric]. Static routes have an AD of 1, so they're trusted over any routing protocol (OSPF is 110).
+- **"variably subnetted, 10 subnets, 3 masks"**: the router knows prefixes of three lengths (/16, /24, /32).
+- **"Gateway of last resort is not set"**: no default route, which is exactly why the two pings failed.
+
+### Default route and longest-prefix match
+
+As the edge router, Router1 got a default route to the Deco:
+
+```
+ip route 0.0.0.0 0.0.0.0 10.0.0.1
+```
+
+Router1 now had two routes matching 10.255.0.1: the 0.0.0.0/0 default and the 10.255.0.1/32 host route. I predicted correctly that the **/32 wins**. The longest (most specific) prefix match always takes priority, so the default route is only used when nothing more specific matches.
+
+### Directly connected networks need no route
+
+I predicted both of these pings would fail, and got one wrong:
+
+| Ping | Source address | Prediction | Actual |
+|---|---|---|---|
+| Router1 → 8.8.8.8 | 10.0.0.15 | Fails | **Works** |
+| VM (VLAN 50) → 8.8.8.8 | 10.10.50.50 | Fails | Fails |
+
+My reasoning was that the Deco had no route back to either source. But 10.0.0.15 is in **10.0.0.0/24, the Deco's own home network**, so the Deco is directly connected to it and needs no route. To the Deco, Router1 is just another home device, like my PC. 10.10.50.50 is a network the Deco has never heard of, so the reply had nowhere to go.
+
+That's the gap NAT on Router1 will close in Phase 8: it rewrites internal source addresses to 10.0.0.15, an address the Deco already knows how to reach.
+
+### What Phase 5 covered
+
+- Default routes (Core-Switch and Router2 to Router1, Router1 to the internet)
+- Network routes, including a summary (10.10.0.0/16 covering every lab VLAN)
+- Host routes (/32 loopbacks)
+- Routing table interpretation: codes, [AD/metric], gateway of last resort
+- Longest-prefix match
+- Why directly connected networks never need a static route
+
+The static routes stay in place going into Phase 6. OSPF will be enabled alongside them to show that static routes (AD 1) beat OSPF (AD 110), and then they'll be removed one at a time so OSPF takes over without losing remote access. Floating static routes are deferred to Phase 8, when a real backup path exists.
+
+---
+
 ## Next Steps
 
-- **Phase 5:** Static routing before OSPF, and routing table analysis.
 - **Phase 6:** Single-area OSPF with a deliberately chosen DR and a default route originated from Router1.
 - **Phase 7:** IPv6 addressing (EUI-64, link-local, SLAAC) and static routing on the routers.
 - **Phase 8:** DHCP with relay, NAT/PAT through the home network, NTP, Syslog, SNMP, and HSRP.
