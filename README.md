@@ -1,11 +1,5 @@
 # Cisco Enterprise Network Lab — Rebuild (v2)
 
-<img width="3024" height="4032" alt="IMG_0556" src="https://github.com/user-attachments/assets/29f41b55-321c-4d61-af04-cbe5aa3350b4" />
-
-
-
-
-
 ## Overview
 
 A full rebuild of my physical Cisco homelab from a clean slate. The first build covered VLANs, trunking, STP, EtherChannel, inter-VLAN routing, OSPF, and ACLs, but it had some design shortcuts I wanted to fix:
@@ -28,12 +22,11 @@ The rebuild is done **from memory**, without referring back to the first build's
 | Access-SW2 | Catalyst 2960-24PC-L | Access switch | 15.0(2)SE11 |
 | Router1 | Cisco 1941 ISR | Edge router (NAT, internet) | 15.0(1)M6 |
 | Router2 | Cisco 1941 ISR | Secondary router (DHCP, HSRP) | 15.7(3)M6 |
-| Proxmox host | Dell OptiPlex 7060 | VM host (to be connected later) | Proxmox VE |
+| Proxmox host | Dell OptiPlex 7060 | VM host on a VLAN trunk | Proxmox VE |
 
 ## Topology
 
-<img width="1199" height="895" alt="Screenshot 2026-10-05 115809" src="https://github.com/user-attachments/assets/0123efc0-c623-4943-91b1-7f49126c3ff5" />
-
+![Lab topology](images/topology.svg)
 
 ### Design changes from v1
 
@@ -1074,9 +1067,189 @@ Recovery didn't need the console. I SSHed to Router1 and hopped to Router2 (`ssh
 
 ---
 
+## Phase 7 — IPv6
+
+IPv6 runs on the two routers. The Core-Switch's 12.2(25)SED1 image isn't used for IPv6 routing; it only carries VLAN 60 at Layer 2 over the existing trunks, which already allowed it. The CCNA IPv6 objectives are addressing, address types, and static routing, all of which fit on the routers.
+
+### Enabling IPv6 routing
+
+On both routers:
+
+```
+ipv6 unicast-routing
+```
+
+Without it, a router can hold IPv6 addresses but won't forward IPv6 between interfaces or send Router Advertisements, which SLAAC depends on.
+
+### EUI-64, calculated by hand first
+
+Router1's G0/1 MAC is `0007.7d78.7701`. Before configuring anything, I built the EUI-64 interface ID manually:
+
+| Step | Result |
+|---|---|
+| Split the 48-bit MAC in half | `0007 7d` · `78 7701` |
+| Insert `FFFE` in the middle | `0007:7DFF:FE78:7701` |
+| Flip the 7th bit of the first byte (U/L bit): `00000000` → `00000010` | `0207:7DFF:FE78:7701` |
+| Add the /64 prefix | **`2001:DB8:60::207:7DFF:FE78:7701`** |
+
+My first attempt changed the wrong byte (`0017`) by adding 16 instead of 2. The 7th bit has a value of 2, and the flip only ever touches the second hex digit of the address: 0↔2, 1↔3, C↔E, and so on.
+
+**Router1 (EUI-64):**
+
+```
+interface g0/1.60
+ encapsulation dot1Q 60
+ ipv6 address 2001:db8:60::/64 eui-64
+interface loopback 0
+ ipv6 address 2001:db8:1::1/128
+```
+
+**Router2 (manual):**
+
+```
+interface g0/1.60
+ encapsulation dot1Q 60
+ ipv6 address 2001:db8:60::3/64
+interface loopback 0
+ ipv6 address 2001:db8:2::1/128
+```
+
+**Verification on Router1** — the global address matched the hand calculation exactly:
+
+```
+GigabitEthernet0/1.60      [up/up]
+    FE80::207:7DFF:FE78:7701
+    2001:DB8:60:0:207:7DFF:FE78:7701
+```
+
+### Link-local addresses
+
+Every IPv6 interface automatically gets an **FE80::/10 link-local** address. IOS builds it with EUI-64 from the MAC unless one is set manually with `ipv6 address <addr> link-local`. Configuring a manual *global* address doesn't change that, as Router2 showed:
+
+```
+GigabitEthernet0/1.60  [up/up]
+    FE80::7E0E:CEFF:FE47:6A61
+    2001:DB8:60::3
+Loopback0              [up/up]
+    FE80::7E0E:CEFF:FE47:6A60
+    2001:DB8:2::1
+```
+
+- Router2's link-local starts `7E0E`, so its MAC starts `7C0E`: the U/L flip turned C (1100) into E (1110).
+- Loopbacks have no MAC, so IOS borrows one from a physical interface. Router2's loopback link-local ends in `6A60` (G0/0's MAC) while G0/1.60's ends in `6A61`.
+
+Link-local addresses are never routed. IPv6 uses them for Neighbor Discovery, Router Advertisements, and as next hops.
+
+### Neighbor Discovery instead of ARP
+
+After pinging Router2 from Router1:
+
+```
+Router1#show ipv6 neighbors
+IPv6 Address                              Age Link-layer Addr State Interface
+FE80::7E0E:CEFF:FE47:6A61                   3 7c0e.ce47.6a61  DELAY Gi0/1.60
+2001:DB8:60::3                              0 7c0e.ce47.6a61  REACH Gi0/1.60
+```
+
+IPv6 has no ARP. ICMPv6 Neighbor Solicitation and Advertisement messages resolve addresses to MACs, and each IPv6 address gets its own entry, so Router2 appears twice with the same MAC. **REACH** means confirmed reachable within the last 30 seconds; **DELAY** means the entry went stale, traffic was just sent, and the router is waiting briefly before probing.
+
+### Static routes: global vs. link-local next hop
+
+```
+! Router1 — global next hop
+ipv6 route 2001:db8:2::1/128 2001:db8:60::3
+
+! Router2 — link-local next hop plus exit interface
+ipv6 route 2001:db8:1::1/128 g0/1.60 FE80::207:7DFF:FE78:7701
+```
+
+A global next hop resolves through the routing table: 2001:db8:60::/64 is connected on G0/1.60, so the router knows which interface to use (a recursive lookup). A link-local next hop can't be resolved that way. Every interface has an FE80:: address, and the same link-local address can exist on several links, so the **exit interface is required**.
+
+**Verification** — pinging with the loopback as the source forces the reply to use the other router's static route, testing both directions at once:
+
+```
+Router1#ping 2001:db8:2::1 source loopback0
+Packet sent with a source address of 2001:DB8:1::1
+!!!!!
+Success rate is 100 percent (5/5)
+```
+
+### IPv6 default route and longest-prefix match
+
+```
+! Router2
+ipv6 route ::/0 2001:db8:60::207:7dff:fe78:7701
+```
+
+`::/0` is the IPv6 equivalent of 0.0.0.0/0. With both the /128 host route and the default in place, I predicted correctly that the **/128 wins** (longest-prefix match works the same as IPv4), and that removing the /128 would leave the loopback ping working through the default. It did.
+
+### SLAAC with a Windows VM
+
+I tagged the Windows VM into VLAN 60 in Proxmox and left IPv6 on "obtain automatically." With no DHCP server and no manual addressing, it configured itself from Router Advertisements:
+
+```
+IPv6 Address. . . . . . . . . . . : 2001:db8:60:0:438f:f91b:4bb8:fc3e
+Temporary IPv6 Address. . . . . . : 2001:db8:60:0:bd5d:6b77:7b62:c0d3
+Link-local IPv6 Address . . . . . : fe80::f65a:4cc5:52c2:b4a3%11
+Default Gateway . . . . . . . . . : fe80::207:7dff:fe78:7701%11
+```
+
+- **The prefix came from the RA; the interface ID didn't use EUI-64.** There's no `FFFE` in the middle. Windows generates a random interface ID so the address doesn't expose the MAC.
+- **Temporary address**: a second, short-lived random address (RFC 4941 privacy extensions) that Windows uses for outgoing connections and rotates regularly.
+- **Default gateway is Router1's link-local address**, the one calculated by hand. Gateways learned from RAs are always link-local.
+- **`%11`** is the zone ID (the interface index). It exists for the same reason the static route needed an exit interface: a link-local address doesn't identify its link on its own.
+
+Router1's neighbor table confirmed which address Windows actually used:
+
+```
+2001:DB8:60:0:BD5D:6B77:7B62:C0D3           0 bc24.115b.ad33  STALE Gi0/1.60
+FE80::F65A:4CC5:52C2:B4A3                   0 bc24.115b.ad33  REACH Gi0/1.60
+```
+
+The VM's **temporary** address was the one learned, confirming Windows uses it for outbound traffic. `BC:24:11` is the MAC prefix Proxmox assigns to virtual NICs.
+
+From the VM, pings to Router2 (2001:db8:60::3) and both router loopbacks succeeded.
+
+### Multicast groups and address types
+
+```
+Router1#show ipv6 interface g0/1.60
+  Joined group address(es):
+    FF02::1
+    FF02::2
+    FF02::1:FF78:7701
+  ND DAD is enabled, number of DAD attempts: 1
+  ND router advertisements are sent every 200 seconds
+  Hosts use stateless autoconfig for addresses.
+```
+
+| Address | Meaning |
+|---|---|
+| `FF02::1` | All nodes on the link. Every IPv6 interface joins it. |
+| `FF02::2` | All routers. Joined only because `ipv6 unicast-routing` is on; hosts send Router Solicitations here. |
+| `FF02::1:FF78:7701` | Solicited-node multicast: `FF02::1:FF` plus the last 24 bits of a unicast address. Neighbor Solicitations go here instead of a broadcast, so only interfaces that might own the address process them. |
+
+Router1 joins only **one** solicited-node group because its link-local and global addresses share the same last 24 bits (`78:7701`). Router2 would join two: `FF02::1:FF00:3` for its manual `::3` address and `FF02::1:FF47:6A61` for its link-local.
+
+The rest of the output ties back to what the VM did: **DAD** (Duplicate Address Detection) checks an address is unused before using it, RAs go out every 200 seconds, and "stateless autoconfig" tells hosts to use SLAAC rather than DHCPv6.
+
+### What Phase 7 covered
+
+| IPv6 topic | How it was verified |
+|---|---|
+| EUI-64 | Calculated by hand, matched the router's output |
+| Manual addressing | Router2 `::3` |
+| Link-local vs. global unicast | Both present on every interface, link-local always auto-generated |
+| Neighbor Discovery | `show ipv6 neighbors` replacing ARP |
+| Static routes (global and link-local next hop) | Loopback-sourced pings in both directions |
+| Default route and longest-prefix match | `::/0` took over when the /128 was removed |
+| SLAAC | Windows VM self-configured from RAs |
+| Multicast and solicited-node addresses | `show ipv6 interface` |
+
+---
+
 ## Next Steps
 
-- **Phase 7:** IPv6 addressing (EUI-64, link-local, SLAAC) and static routing on the routers.
 - **Phase 8:** DHCP with relay, NAT/PAT through the home network, NTP, Syslog, SNMP, and HSRP.
 - **Phase 9:** Redesigned ACLs, port security, DHCP snooping, and Dynamic ARP Inspection. The VTY access-class must permit my home network (10.0.0.0/24) as well as VLAN 30, since I now manage the lab from 10.0.0.88.
 - **Phase 10:** Netmiko automation, and a full power-cycle sign-off.
