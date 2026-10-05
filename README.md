@@ -26,7 +26,7 @@ The rebuild is done **from memory**, without referring back to the first build's
 
 ## Topology
 
-![Lab topology](images/topology.svg)
+![Lab topology](/topology.svg)
 
 ### Design changes from v1
 
