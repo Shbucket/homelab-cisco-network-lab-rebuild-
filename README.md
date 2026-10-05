@@ -925,9 +925,167 @@ The static routes stay in place going into Phase 6. OSPF will be enabled alongsi
 
 ---
 
+## Phase 6 — OSPF (Single Area, Built Deliberately)
+
+In v1, OSPF worked, but several outcomes were accidental: the DR was decided by router ID, every link cost the same, and hellos went out on every interface. This time each of those was a design decision, and the static routes from Phase 5 stayed in place until OSPF had proven it could replace them.
+
+### Core-Switch
+
+```
+configure terminal
+interface vlan 100
+ ip ospf priority 255
+router ospf 1
+ router-id 10.255.0.1
+ auto-cost reference-bandwidth 10000
+ passive-interface default
+ no passive-interface Vlan100
+ network 10.0.100.0 0.0.0.255 area 0
+ network 10.10.10.0 0.0.0.255 area 0
+ network 10.10.20.0 0.0.0.255 area 0
+ network 10.10.30.0 0.0.0.255 area 0
+ network 10.255.0.1 0.0.0.0 area 0
+end
+write memory
+```
+
+- **`ip ospf priority 255`** on VLAN 100 makes the Core-Switch the intended DR on the transit segment. It was set **before** the routers joined, because DR elections aren't preemptive.
+- **`router-id`** is set manually to match Loopback 0, so it never changes on its own.
+- **`auto-cost reference-bandwidth 10000`** (10 Gbps), set on all three devices. With the default 100 Mbps reference, every link at 100 Mbps or faster costs 1, so OSPF can't tell gigabit from FastEthernet. The SVIs now cost 10.
+- **`passive-interface default`** with **`no passive-interface Vlan100`**: hellos only go out where OSPF neighbors exist. The user VLANs are still advertised, but no OSPF packets reach end devices.
+- **Wildcard masks** are the inverse of subnet masks: `0.0.0.255` matches a /24, and `0.0.0.0` matches one exact address.
+
+### Router1 and Router2
+
+```
+! Router1
+router ospf 1
+ router-id 10.255.0.2
+ auto-cost reference-bandwidth 10000
+ passive-interface default
+ no passive-interface g0/1.100
+ network 10.0.100.0 0.0.0.255 area 0
+ network 10.10.50.0 0.0.0.255 area 0
+ network 10.255.0.2 0.0.0.0 area 0
+ default-information originate
+
+! Router2
+router ospf 1
+ router-id 10.255.0.3
+ auto-cost reference-bandwidth 10000
+ passive-interface default
+ no passive-interface g0/1.100
+ network 10.0.100.0 0.0.0.255 area 0
+ network 10.255.0.3 0.0.0.0 area 0
+```
+
+Router1's G0/0 (home network) is deliberately left out of OSPF. Instead, **`default-information originate`** advertises Router1's existing static default (to the Deco) into OSPF. It only advertises a default route the router already has. Adding `always` would advertise one regardless.
+
+### DR/BDR election, predicted at each step
+
+| Event | Prediction | Result |
+|---|---|---|
+| Core-Switch alone on VLAN 100 | DR (after the 40-second WAIT) | WAIT → DR |
+| Router1 joins | BDR (DR already exists) | BDR (after fixing the issue below) |
+| Router2 joins | DROTHER, despite a higher router ID than Router1, because BDR also doesn't preempt | DROTHER |
+
+```
+Router2#show ip ospf neighbor
+Neighbor ID     Pri   State           Dead Time   Address         Interface
+10.255.0.1      255   FULL/DR         00:00:35    10.0.100.1      GigabitEthernet0/1.100
+10.255.0.2        1   FULL/BDR        00:00:36    10.0.100.2      GigabitEthernet0/1.100
+```
+
+Router2 forms FULL adjacencies with both the DR and BDR. Two DROTHERs on the same segment would stop at **2WAY** with each other and only fully synchronize with the DR and BDR. Reducing the number of full adjacencies is the reason DRs exist.
+
+### Migrating from static routes to OSPF
+
+OSPF was enabled with the Phase 5 static routes still in place.
+
+**Static routes beat OSPF for the same prefix.** After Router1's `default-information originate`, the Core-Switch's table still showed:
+
+```
+S*   0.0.0.0/0 [1/0] via 10.0.100.2
+```
+
+OSPF had learned the default, but a static route (AD 1) beats OSPF (AD 110), so the OSPF route stayed hidden. Only the winning route for a prefix is installed.
+
+**Removing the static revealed the OSPF route:**
+
+```
+O*E2 0.0.0.0/0 [110/1] via 10.0.100.2, 00:00:24, Vlan100
+```
+
+- **E2** (external type 2): the route came from outside OSPF, Router1's static route injected by `default-information originate`.
+- **[110/1]**: E2 routes keep a fixed metric of 1, no matter how far away the advertising router is.
+- The gateway of last resort didn't change, and SSH stayed up throughout. The OSPF route took over the instant the static was removed.
+
+Router2's static default was removed next, then Router1's summary and host routes, keeping only Router1's default to the Deco.
+
+**Prediction:** I predicted correctly that Router1 would learn the lab VLANs as **separate /24s**, not one /16. Each SVI network is advertised individually, and OSPF doesn't auto-summarize. Summarization is only possible at area borders, and this is a single area.
+
+```
+O        10.10.10.0/24 [110/20] via 10.0.100.1, 00:55:21, GigabitEthernet0/1.100
+O        10.10.20.0/24 [110/20] via 10.0.100.1, 00:55:21, GigabitEthernet0/1.100
+O        10.10.30.0/24 [110/20] via 10.0.100.1, 00:55:21, GigabitEthernet0/1.100
+O        10.255.0.1/32 [110/11] via 10.0.100.1, 00:00:23, GigabitEthernet0/1.100
+O        10.255.0.3/32 [110/11] via 10.0.100.3, 00:00:10, GigabitEthernet0/1.100
+```
+
+**The route timers told a second story.** The VLAN routes had been installed for **55 minutes**, the whole time the static /16 existed. Administrative distance only compares routes for the **exact same prefix**. A /16 and a /24 are different prefixes, so both were installed, and longest-prefix match meant traffic was already using the OSPF /24s. The loopback routes were only seconds old, because they had the same /32 prefix as the static host routes, which blocked them until they were removed.
+
+**Cost check:** loopbacks show 11 (10 for the VLAN 100 link plus 1 for the loopback), and the remote VLANs show 20 (10 plus 10).
+
+After the migration, SSH from my PC to all five devices still worked, now entirely over OSPF. The lab's only static route is Router1's default to the internet.
+
+### Break-it tests
+
+**Hello timer mismatch.** I set Router2's hello interval to 5 seconds on G0/1.100, which automatically makes the dead interval 20 seconds. The Core-Switch and Router1 stayed at 10/40.
+
+```
+%OSPF-5-ADJCHG: Process 1, Nbr 10.255.0.2 on GigabitEthernet0/1.100 from FULL to DOWN, Neighbor Down: Dead timer expired
+```
+
+The adjacency didn't drop immediately. Each side silently discarded the other's hellos because the timers didn't match, and the neighbors only went down once the dead timer expired (Router2's 20 seconds first). There's no explicit error. The failure only shows up when the dead timer runs out, so the diagnosis is to compare `show ip ospf interface` on both ends.
+
+**Area mismatch.** I moved Router2's transit network to area 1:
+
+```
+%OSPF-4-ERRRCV: Received invalid packet: mismatched area ID from backbone area from 10.0.100.2, GigabitEthernet0/1.100
+```
+
+This time IOS logged an explicit error, naming the problem, repeating with every hello.
+
+| | Timer mismatch | Area mismatch |
+|---|---|---|
+| Error logged | None | `ERRRCV: mismatched area ID` |
+| How it shows up | Dead timer expires | Immediately, repeating every hello |
+| Diagnosis | Compare `show ip ospf interface` on both ends | The log message names it |
+
+Settings that must match for an adjacency: area ID, hello/dead timers, subnet and mask, authentication, and stub flag. Router IDs must be unique. An MTU mismatch lets neighbors get past 2WAY but leaves them stuck in EXSTART/EXCHANGE.
+
+### Lessons Learned / Troubleshooting — Phase 6
+
+**Wrong device again, with a hidden side effect.** Router1's OSPF commands were pasted into the Core-Switch, and the error only appeared at `no passive-interface g0/1.100`, an interface the Core-Switch doesn't have. The lines before it had been accepted, so I checked `show run | section router ospf` and removed the stray `router-id 10.255.0.2` and Router1's network statements. A router ID change doesn't take effect until the OSPF process restarts, so the Core-Switch never actually ran as 10.255.0.2.
+
+The less obvious damage showed up later. Router1 sat as **DR with 0 neighbors** after its own OSPF config, meaning it wasn't hearing hellos from the Core-Switch. The cause was the pasted `passive-interface default`: **entering it again resets every interface to passive**, silently undoing the earlier `no passive-interface Vlan100`. The Core-Switch had stopped sending hellos on the transit network. Re-entering `no passive-interface Vlan100` brought the adjacency up.
+
+**DR non-preemption, live.** When the adjacency formed, the Core-Switch came up as **FULL/BDR**, despite priority 255:
+
+```
+10.255.0.1      255   FULL/BDR        00:00:38    10.0.100.1      GigabitEthernet0/1.100
+```
+
+While the Core-Switch was accidentally passive, Router1 had been alone on VLAN 100 and became DR. When the Core-Switch returned, it found an existing DR, and a higher priority doesn't take over. `clear ip ospf process` on Router1 forced a new election: the Core-Switch (the BDR) was immediately promoted to DR, which is the BDR's purpose, and Router1 rejoined as BDR. It was a real demonstration of why `ip ospf priority` has to be set before neighbors form.
+
+**Breaking OSPF cut off Router2's own management.** The hello timer test dropped my SSH session to Router2. After Phase 6, Router2 had no static routes, so its **only** route back to my PC (10.0.0.88) was the OSPF default from Router1. When the adjacency dropped, Router2 lost that route. My SSH packets still reached it (Router1 is directly connected to 10.0.100.0/24), but Router2 had no route for the replies. It's the "there and back" rule from Phase 5 again.
+
+Recovery didn't need the console. I SSHed to Router1 and hopped to Router2 (`ssh -l admin 10.0.100.3`). That session came from 10.0.100.2, on Router2's own subnet, so Router2 could reply with no routes at all. The area-mismatch test was run from that hop session for the same reason. The takeaway: a router that relies entirely on a dynamic routing protocol also relies on it for its own management, so when breaking a protocol on purpose, keep a path in that doesn't depend on it.
+
+---
+
 ## Next Steps
 
-- **Phase 6:** Single-area OSPF with a deliberately chosen DR and a default route originated from Router1.
 - **Phase 7:** IPv6 addressing (EUI-64, link-local, SLAAC) and static routing on the routers.
 - **Phase 8:** DHCP with relay, NAT/PAT through the home network, NTP, Syslog, SNMP, and HSRP.
 - **Phase 9:** Redesigned ACLs, port security, DHCP snooping, and Dynamic ARP Inspection. The VTY access-class must permit my home network (10.0.0.0/24) as well as VLAN 30, since I now manage the lab from 10.0.0.88.
