@@ -1,6 +1,10 @@
 # Cisco Enterprise Network Lab — Rebuild (v2)
 
 <img width="3024" height="4032" alt="IMG_0556" src="https://github.com/user-attachments/assets/29f41b55-321c-4d61-af04-cbe5aa3350b4" />
+</br>
+<img width="1199" height="895" alt="Screenshot 2026-10-05 115809" src="https://github.com/user-attachments/assets/0123efc0-c623-4943-91b1-7f49126c3ff5" />
+
+
 
 
 ## Overview
