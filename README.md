@@ -1,5 +1,7 @@
 # Cisco Enterprise Network Lab — Rebuild (v2)
 
+
+<img src="IMG_0567.jpeg" >
 ## Overview
 
 A full rebuild of my physical Cisco homelab from a clean slate. The first build covered VLANs, trunking, STP, EtherChannel, inter-VLAN routing, OSPF, and ACLs, but it had some design shortcuts I wanted to fix:
