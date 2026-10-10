@@ -9,9 +9,11 @@ A full rebuild of my physical Cisco homelab from a clean slate. The first build 
 - The STP root bridge was chosen by the lowest MAC address, not by design.
 - Access-SW1 was daisy-chained behind Access-SW2 instead of uplinking to the core.
 
-This rebuild fixes those problems and adds the CCNA 200-301 topics the first build didn't cover: NAT/PAT, DHCP, HSRP, router-on-a-stick, static and floating static routes, IPv6, port security, DHCP snooping, DAI, NTP, Syslog, and SNMP.
+This rebuild fixes those problems and adds the topics the first build didn't cover: router-on-a-stick, static routing, IPv6, NAT/PAT, NTP, DHCP with relay, and HSRP.
 
-The rebuild is done **from memory**, without referring back to the first build's notes unless I get stuck. Anything I have to look up goes into a weak-topic log for exam review.
+The rebuild was done **from memory**, without referring back to the first build's notes unless I got stuck, and every change followed the same method: predict the result, configure, verify with `show` output, then break it on purpose.
+
+**Scope note:** The network build stops after Phase 8. My target role is IT support, so the lab now continues as the infrastructure for a Windows Server / Active Directory environment (see *What's Next*). The network-engineering items originally planned for later phases (Syslog/SNMP, DHCP snooping, DAI) were deliberately left out.
 
 ## Hardware
 
@@ -21,12 +23,12 @@ The rebuild is done **from memory**, without referring back to the first build's
 | Access-SW1 | Catalyst 2960-24PC-L | Access switch | 15.0(2)SE11 |
 | Access-SW2 | Catalyst 2960-24PC-L | Access switch | 15.0(2)SE11 |
 | Router1 | Cisco 1941 ISR | Edge router (NAT, internet) | 15.0(1)M6 |
-| Router2 | Cisco 1941 ISR | Secondary router (DHCP, HSRP) | 15.7(3)M6 |
+| Router2 | Cisco 1941 ISR | DHCP server, HSRP standby | 15.7(3)M6 |
 | Proxmox host | Dell OptiPlex 7060 | VM host on a VLAN trunk | Proxmox VE |
 
 ## Topology
 
-![Lab topology](/topology.svg)
+![Lab topology](topology.svg)
 
 ### Design changes from v1
 
@@ -47,7 +49,7 @@ The rebuild is done **from memory**, without referring back to the first build's
 | 10 | WORKSTATIONS | 10.10.10.0/24 | 10.10.10.1 (Core-Switch SVI) |
 | 20 | SERVERS | 10.10.20.0/24 | 10.10.20.1 (Core-Switch SVI) |
 | 30 | MGMT | 10.10.30.0/24 | 10.10.30.1 (Core-Switch SVI) |
-| 50 | GUEST | 10.10.50.0/24 | 10.10.50.1 (HSRP VIP on Router1/Router2) |
+| 50 | GUEST | 10.10.50.0/24 | 10.10.50.1 (HSRP virtual IP; Router1 .2, Router2 .3) |
 | 60 | IPV6-LAB | 2001:db8:60::/64 | Router1/Router2 subinterfaces |
 | 99 | NATIVE | none | Trunk native VLAN only, carries no traffic |
 | 100 | TRANSIT | 10.0.100.0/24 | Core-Switch .1, Router1 .2, Router2 .3 |
@@ -904,7 +906,7 @@ That's the gap NAT on Router1 will close in Phase 8: it rewrites internal source
 - Longest-prefix match
 - Why directly connected networks never need a static route
 
-The static routes stay in place going into Phase 6. OSPF will be enabled alongside them to show that static routes (AD 1) beat OSPF (AD 110), and then they'll be removed one at a time so OSPF takes over without losing remote access. Floating static routes are deferred to Phase 8, when a real backup path exists.
+The static routes stay in place going into Phase 6. OSPF will be enabled alongside them to show that static routes (AD 1) beat OSPF (AD 110), and then they'll be removed one at a time so OSPF takes over without losing remote access. Floating static routes weren't built: they need a second internet path, and the home router has no free port for one.
 
 ---
 
@@ -1248,8 +1250,190 @@ The rest of the output ties back to what the VM did: **DAD** (Duplicate Address 
 
 ---
 
-## Next Steps
+## Phase 8 — IP Services: NAT, NTP, DHCP, and HSRP
 
-- **Phase 8:** DHCP with relay, NAT/PAT through the home network, NTP, Syslog, SNMP, and HSRP.
-- **Phase 9:** Redesigned ACLs, port security, DHCP snooping, and Dynamic ARP Inspection. The VTY access-class must permit my home network (10.0.0.0/24) as well as VLAN 30, since I now manage the lab from 10.0.0.88.
-- **Phase 10:** Netmiko automation, and a full power-cycle sign-off.
+This is the phase that gave the lab real internet access and made it behave like a small office network: hosts get addresses automatically, every device agrees on the time, and the guest VLAN's gateway survives a router failure.
+
+### NAT/PAT on Router1
+
+```
+interface g0/0
+ ip nat outside
+interface g0/1.50
+ ip nat inside
+interface g0/1.100
+ ip nat inside
+!
+ip access-list extended NAT-INSIDE
+ deny   ip 10.10.0.0 0.0.255.255 10.0.0.0 0.0.0.255
+ deny   ip 10.0.100.0 0.0.0.255 10.0.0.0 0.0.0.255
+ permit ip 10.10.0.0 0.0.255.255 any
+ permit ip 10.0.100.0 0.0.0.255 any
+!
+ip nat inside source list NAT-INSIDE interface g0/0 overload
+```
+
+- VLANs 10, 20, and 30 reach Router1 over the transit link, so **G0/1.100 is an inside interface** alongside G0/1.50.
+- **`overload`** makes this PAT: every inside host shares Router1's single home-network address (10.0.0.15), with connections told apart by source port.
+
+**Why the ACL had to be extended.** I manage the lab from my PC on the home network (10.0.0.88). Without the two `deny` lines, a reply from a lab device back to my PC would leave G0/0 with a source address matching the ACL, get translated to 10.0.0.15, and arrive at my PC from an address it never contacted, so it would be dropped. SSH to everything except Router1 would break. A standard ACL can only match the source, so it can't express "translate lab traffic, except when it's going to the home network." The extended `deny` lines exempt that return traffic, which is then routed normally. Confirmed afterwards: SSH from my PC to every device still worked.
+
+**First test** — the Core-Switch's ping to 8.8.8.8 leaves from 10.0.100.1, so it was an easy first check:
+
+```
+Pro Inside global         Inside local          Outside local         Outside global
+icmp 10.0.0.15:0          10.0.100.1:0          8.8.8.8:0             8.8.8.8:0
+```
+
+| Column | Meaning |
+|---|---|
+| Inside local | The inside host's real address |
+| Inside global | What the outside sees — Router1's G0/0 |
+| Outside local / global | The outside host; identical because only inside addresses are translated |
+
+**Real traffic** — a Windows VM in VLAN 10 loading a web page produced about **300 translations**:
+
+```
+udp 10.0.0.15:49209    10.10.10.50:49209    8.8.8.8:53           8.8.8.8:53
+tcp 10.0.0.15:56232    10.10.10.50:56232    40.126.29.13:443     40.126.29.13:443
+udp 10.0.0.15:56352    10.10.10.50:56352    142.251.35.230:443   142.251.35.230:443
+tcp 10.0.0.15:56352    10.10.10.50:56352    35.227.251.32:443    35.227.251.32:443
+```
+
+- **Every source port was preserved.** With only one inside host there were no collisions, so Router1 never had to substitute a port.
+- **Most of the traffic wasn't the site I opened**: Windows Update, telemetry, and CDNs. One ordinary Windows machine opens a surprising number of connections.
+- **`udp … :443`** is QUIC (HTTP/3).
+- **Port 56352 appears as both tcp and udp.** That's not a collision, since PAT tracks protocol, address, and port together.
+
+### NTP
+
+**Router1** syncs to Google's public time servers (by IP, so NTP doesn't depend on DNS):
+
+```
+clock timezone EST -5
+clock summer-time EDT recurring
+ntp server 216.239.35.0
+ntp server 216.239.35.4
+service timestamps log datetime msec localtime show-timezone
+```
+
+```
+Router1#show ntp associations
+  address         ref clock       st   when   poll reach  delay  offset   disp
+*~216.239.35.0    .GOOG.           1     14     64    37 39.067   0.061 440.36
++~216.239.35.4    .GOOG.           1     11     64    37 41.328   5.524 438.96
+```
+
+`*` is the server Router1 follows, `+` a healthy backup, and `reach 37` is an octal bitmask showing the last 5 polls succeeded (it counts up to 377).
+
+**Every other device** points at Router1's loopback, which stays reachable over OSPF as long as Router1 has any working path:
+
+```
+ntp server 10.255.0.2
+```
+
+**Stratum prediction**, which I got right: Google is stratum 1, so Router1 is stratum 2 and everything syncing from it is stratum 3.
+
+```
+Access-SW1#show ntp status
+Clock is synchronized, stratum 3, reference is 10.255.0.2
+clock offset is -1.2125 msec
+Access-SW1#show clock
+10:44:29.988 edt Sat Oct 10 2026
+```
+
+Log timestamps went from the untrusted `*Mar 1` to real local time, about 1 ms apart across the whole network.
+
+### DHCP on Router2, relayed from VLAN 10
+
+Router2 serves VLAN 10 even though it isn't on VLAN 10:
+
+```
+! Router2
+ip dhcp excluded-address 10.10.10.1 10.10.10.99
+ip dhcp pool VLAN10
+ network 10.10.10.0 255.255.255.0
+ default-router 10.10.10.1
+ dns-server 8.8.8.8
+ domain-name lab.local
+
+! Core-Switch
+interface vlan 10
+ ip helper-address 10.255.0.3
+```
+
+A DHCP Discover is a broadcast, and routers don't forward broadcasts. `ip helper-address` on the **client-facing** SVI catches it and forwards it to Router2's loopback as a unicast. The relay also fills in the **giaddr** field with the address of the interface it heard the broadcast on (10.10.10.1). Router2 uses giaddr to pick the matching pool, and sends the Offer back to it.
+
+```
+Router2#show ip dhcp binding
+IP address          Client-ID/              Lease expiration        Type
+10.10.10.100        01bc.2411.5bad.33       Oct 11 2026 10:49 AM    Automatic
+```
+
+The first address after the excluded range; the client ID is `01` (Ethernet) plus the VM's MAC; the IOS default lease is one day.
+
+**VLAN 50** is served directly. Router2 is on that segment, so it hears the broadcast itself and no relay is needed:
+
+```
+ip dhcp excluded-address 10.10.50.1 10.10.50.99
+ip dhcp pool VLAN50
+ network 10.10.50.0 255.255.255.0
+ default-router 10.10.50.1
+ dns-server 8.8.8.8
+```
+
+The VM moved to VLAN 50 and received **10.10.50.100**. The `default-router` is the **HSRP virtual IP**, not either router's real address. If hosts were given .2 and Router1 failed, they'd keep sending to a dead gateway until their lease renewed.
+
+### HSRP on VLAN 50
+
+```
+! Router1
+track 1 interface g0/0 line-protocol
+interface g0/1.50
+ ip address 10.10.50.2 255.255.255.0
+ standby 1 ip 10.10.50.1
+ standby 1 priority 110
+ standby 1 preempt
+ standby 1 track 1 decrement 20
+
+! Router2
+interface g0/1.50
+ encapsulation dot1Q 50
+ ip address 10.10.50.3 255.255.255.0
+ standby 1 ip 10.10.50.1
+ standby 1 preempt
+router ospf 1
+ network 10.10.50.0 0.0.0.255 area 0
+```
+
+- Router1's priority of 110 beats Router2's default 100, so Router1 is **active**, as predicted.
+- **`preempt`** lets Router1 take the role back after it recovers.
+- **Object tracking**: if Router1's internet link (G0/0) goes down, its priority drops to 90, and Router2 takes over.
+- Hosts ARP for 10.10.50.1 and get the **virtual MAC 0000.0c07.ac01** (HSRPv1, group 1). Whichever router is active answers for that MAC, so hosts never notice a failover.
+
+**Failover test.** With a continuous ping from the VLAN 50 VM to 8.8.8.8, I shut down Router1's G0/1.50:
+
+- **Only 2 pings were lost.** An administrative `shutdown` makes the active router send a **Resign** message, so Router2 takes over immediately instead of waiting for the 10-second hold timer. A real failure (power loss or a pulled cable) sends no Resign and would cost closer to 10 seconds.
+- **Internet access kept working through Router2**, even though Router2 has no internet link or NAT. Router2 followed its OSPF default route to Router1, where the traffic entered on G0/1.100 (a NAT inside interface) and was translated as usual. On the way back, Router1's own VLAN 50 interface was down, so it delivered replies using the **OSPF route Router2 advertises for 10.10.50.0/24**. Adding VLAN 50 to Router2's OSPF config is what made that return path exist.
+- **When G0/1.50 came back, Router1 became active again**, thanks to its higher priority and `preempt`.
+
+### Lessons Learned / Troubleshooting — Phase 8
+
+**NAT can break management access.** The NAT ACL had to be extended, not standard, to exempt replies going back to my management PC. This was designed in from the start instead of discovered by breaking SSH, but it's the most important design detail in the phase.
+
+**The same exemption broke Proxmox's DNS.** The Proxmox host still pointed at the Deco (10.0.0.1) for DNS from before it moved into the lab. Because lab-to-home-network traffic is deliberately not translated, and the Deco has no route back to 10.10.30.0/24, its DNS replies never arrived. The fix was to point Proxmox's DNS at 8.8.8.8, which *does* get translated. The rule that keeps SSH working is the same rule that broke this.
+
+**Copying output out of a VM console.** The Proxmox console (noVNC) doesn't share a clipboard with the host PC, so I verified DHCP from the router side instead (`show ip dhcp binding`), which is how it's usually done on a real network anyway.
+
+---
+
+## What's Next
+
+My target role is **IT support**, so the network build stops here. NAT, NTP, DHCP, and HSRP are complete, and the network now serves as the infrastructure for a Windows environment. The next project builds on it:
+
+1. **Active Directory domain controller** — Windows Server VM in VLAN 20 at 10.10.20.20, AD DS and DNS, domain `lab.internal`, synced to Router1 for NTP (Kerberos needs clocks within 5 minutes).
+2. **Domain-joined clients** — VLAN 10's DHCP pool hands out the DC as its DNS server; join the Windows 10 VM and troubleshoot join failures.
+3. **Everyday support tasks** — users, groups, OUs, password resets and unlocks, file shares with NTFS permissions, home folders.
+4. **Group Policy** — password policy, mapped drives, desktop restrictions; troubleshooting with `gpresult` and `gpupdate`.
+5. **Ticket-style troubleshooting** — break something realistic, then diagnose, fix, and document it as a support ticket.
+6. **Intune and Entra ID** — device management in the cloud, aligned with MD-102.
